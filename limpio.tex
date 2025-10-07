@@ -1,0 +1,205 @@
+\documentclass[border=15pt, multi, tikz]{standalone}
+\usepackage{import}
+\usepackage{graphicx} % Añadido por si acaso
+
+% Asegúrate de que la ruta a 'init.tex' sea correcta
+\subimport{./layers/}{init} 
+\usetikzlibrary{positioning, 3d}
+
+% Paleta de colores (sin cambios)
+\def\InputColor{rgb:blue,2;white,10}
+\def\ConvColor{rgb:yellow,5;red,2.5;white,5}
+\def\ConvActNormColor{rgb:yellow,5;red,5;white,5}
+\def\DenseColor{rgb:blue,5;green,2.5;white,5}
+\def\DcnvColor{rgb:blue,5;green,2.5;white,5}
+\def\SoftmaxColor{rgb:magenta,5;black,7}
+\def\SumColor{rgb:blue,5;green,15}
+\def\ClassifierColor{rgb:blue,2;black,0.4}
+
+\begin{document}
+\begin{tikzpicture}
+  \tikzstyle{connection}=[ultra thick,
+    every node/.style={sloped,allow upside down},
+    draw=\edgecolor,opacity=0.7]
+
+  %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+  %% PLACEHOLDERS (sin cambios)
+  %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+  \node[canvas is zy plane at x=-3] (ch1) at (-4, 10, 0)
+        {\includegraphics[width=4cm]{pearson_matrix.png}};
+  \node[canvas is zy plane at x=-3] (ch2) at (-4,  0, 0)
+        {\includegraphics[width=4cm]{mi_knn_matrix.png}};
+  \node[canvas is zy plane at x=-3] (ch3) at (-4,-10, 0)
+        {\includegraphics[width=4cm]{distcorr_matrix.png}};
+
+  %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+  %% ENCODER
+  %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+  % --- INPUT
+  \pic[shift={(0,0,0)}] at (0,0,0) {Box={
+      name=in, % caption=Input, % <-- CAPTION ELIMINADO
+      xlabel={{"3"}}, zlabel={$131\times131$},
+      fill=\InputColor, opacity=0.8,
+      height=40, width=2, depth=40
+  }};
+
+  % Flechas desde las imágenes
+  \draw[connection,opacity=0.5] (ch1.east) -- ++(0.8,0,0) -- (in-west);
+  \draw[connection,opacity=0.5] (ch2.east) -- ++(0.8,0,0) -- (in-west);
+  \draw[connection,opacity=0.5] (ch3.east) -- ++(0.8,0,0) -- (in-west);
+
+  % conv1
+  \pic[shift={(1.8,0,0)}] at (in-east) {RightBandedBox={
+      name=enc1, % caption={Conv7$\times$7, s=2 | GELU | GN}, % <-- CAPTION ELIMINADO
+      xlabel={{"16"}}, zlabel={$64\times64$},
+      fill=\ConvColor, bandfill=\ConvActNormColor,
+      height=36, width={2.5}, depth=36
+  }};
+
+  % conv2
+  \pic[shift={(1.8,0,0)}] at (enc1-east) {RightBandedBox={
+      name=enc2, % caption={Conv5$\times$5, s=2 | GELU | GN}, % <-- CAPTION ELIMINADO
+      xlabel={{"32"}}, zlabel={$31\times31$},
+      fill=\ConvColor, bandfill=\ConvActNormColor,
+      height=30, width={3}, depth=30
+  }};
+
+  % conv3
+  \pic[shift={(1.8,0,0)}] at (enc2-east) {RightBandedBox={
+      name=enc3, % caption={Conv5$\times$5, s=2 | GELU | GN}, % <-- CAPTION ELIMINADO
+      xlabel={{"64"}}, zlabel={$15\times15$},
+      fill=\ConvColor, bandfill=\ConvActNormColor,
+      height=24, width={3.5}, depth=24
+  }};
+
+  % conv4
+  \pic[shift={(1.8,0,0)}] at (enc3-east) {RightBandedBox={
+      name=enc4, % caption={Conv3$\times$3, s=2 | GELU | GN}, % <-- CAPTION ELIMINADO
+      xlabel={{"128"}}, zlabel={$8\times8$},
+      fill=\ConvColor, bandfill=\ConvActNormColor,
+      height=18, width={4}, depth=18
+  }};
+
+  % Conexiones del encoder
+  \draw [connection] (in-east) -- node{\midarrow} (enc1-west);
+  \draw [connection] (enc1-east) -- node{\midarrow} (enc2-west);
+  \draw [connection] (enc2-east) -- node{\midarrow} (enc3-west);
+  \draw [connection] (enc3-east) -- node{\midarrow} (enc4-west);
+
+  %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+  %% BLOQUE LATENTE
+  %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+  % Flatten y FC
+  \pic[shift={(2.0,0,0)}] at (enc4-east) {Box={
+      name=fc_int, % caption={Flatten \& FC (2048)}, % <-- CAPTION ELIMINADO
+      xlabel={{"2048"}},
+      fill=\DenseColor, opacity=0.8,
+      height=12, width=2, depth=12
+  }};
+  \draw [connection] (enc4-east) -- node{\midarrow} (fc_int-west);
+
+  % Cabezas μ y logσ²
+  \pic[shift={(2.0, 2.0,0)}] at (fc_int-east) {Box={
+      name=mu, caption={$\mu$}, % Se mantiene para claridad
+      xlabel={{"512"}}, fill=\DenseColor, opacity=0.9,
+      height=8, width=1.6, depth=8
+  }};
+  \pic[shift={(2.0, -2.0,0)}] at (fc_int-east) {Box={
+      name=logvar, caption={log$\sigma^2$}, % Se mantiene para claridad
+      xlabel={{"512"}}, fill=\DenseColor, opacity=0.9,
+      height=8, width=1.6, depth=8
+  }};
+  \draw [connection] (fc_int-east) -- node{\midarrow} (mu-west);
+  \draw [connection] (fc_int-east) -- node{\midarrow} (logvar-west);
+
+  % Reparametrización
+  \pic[shift={(2.5,0,0)}] at (fc_int-east) {Ball={
+      name=zball, radius=2.3, logo=$z$
+  }};
+  \draw [connection] (mu-east) -- node{\midarrow} (zball.north west);
+  \draw [connection] (logvar-east) -- node{\midarrow} (zball.south west);
+
+  %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+  %% DECODER
+  %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+  % FC -> reshape
+  \pic[shift={(1.8,0,0)}] at (zball-east) {Box={
+      name=fc_reshape, % caption={FC $\to$ Reshape}, % <-- CAPTION ELIMINADO
+      xlabel={{"128"}}, zlabel={$8\times8$},
+      fill=\DenseColor, opacity=0.8,
+      height=18, width=1.8, depth=18
+  }};
+  \draw [connection] (zball-east) -- node{\midarrow} (fc_reshape-west);
+
+  % deconv1
+  \pic[shift={(1.6,0,0)}] at (fc_reshape-east) {Box={
+      name=dec1, % caption={DeconvT 3$\times$3, s=2 | GELU | GN}, % <-- CAPTION ELIMINADO
+      xlabel={{"64"}}, zlabel={$15\times15$},
+      fill=\DcnvColor, opacity=0.85,
+      height=24, width=2.4, depth=24
+  }};
+  \draw [connection] (fc_reshape-east) -- node{\midarrow} (dec1-west);
+
+  % deconv2
+  \pic[shift={(1.6,0,0)}] at (dec1-east) {Box={
+      name=dec2, % caption={DeconvT 5$\times$5, s=2 | GELU | GN}, % <-- CAPTION ELIMINADO
+      xlabel={{"32"}}, zlabel={$31\times31$},
+      fill=\DcnvColor, opacity=0.85,
+      height=30, width=2.2, depth=30
+  }};
+  \draw [connection] (dec1-east) -- node{\midarrow} (dec2-west);
+
+  % deconv3
+  \pic[shift={(1.6,0,0)}] at (dec2-east) {Box={
+      name=dec3, % caption={DeconvT 5$\times$5, s=2 | GELU | GN}, % <-- CAPTION ELIMINADO
+      xlabel={{"16"}}, zlabel={$64\times64$},
+      fill=\DcnvColor, opacity=0.85,
+      height=36, width=2.0, depth=36
+  }};
+  \draw [connection] (dec2-east) -- node{\midarrow} (dec3-west);
+
+  % deconv4
+  \pic[shift={(1.6,0,0)}] at (dec3-east) {Box={
+      name=dec4, % caption={DeconvT 7$\times$7, s=2}, % <-- CAPTION ELIMINADO
+      xlabel={{"3"}}, zlabel={$131\times131$},
+      fill=\DcnvColor, opacity=0.85,
+      height=40, width=1.8, depth=40
+  }};
+  \draw [connection] (dec3-east) -- node{\midarrow} (dec4-west);
+
+  % activación final
+  \pic[shift={(1.2,0,0)}] at (dec4-east) {Box={
+      name=out, % caption={tanh (Recon)}, % <-- CAPTION ELIMINADO
+      xlabel={{"3"}}, zlabel={$131\times131$},
+      fill=\SoftmaxColor, opacity=0.7,
+      height=40, width=1.6, depth=40
+  }};
+  \draw [connection] (dec4-east) -- node{\midarrow} (out-west);
+
+  %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+  %% RAMA A CLASIFICADORES
+  %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+  % Nodo para indicar uso de mu
+  \pic[shift={(0.0,3.6,0)}] at (mu-north) {Box={
+      name=mu_used, % caption={Latent $\mu$ Features}, % <-- CAPTION ELIMINADO
+      xlabel={{"512"}}, fill=\DenseColor, opacity=0.95,
+      height=8, width=2.0, depth=8
+  }};
+  \draw [connection] (mu-north) -- node{\midarrow} (mu_used-south);
+
+  % Cuadro de clasificadores
+  \pic[shift={(4.2,0.0,0)}] at (mu_used-east) {RightBandedBox={
+      name=clf, % caption={Classifiers}, % <-- CAPTION ELIMINADO
+      xlabel={{"XGB, SVM, LogReg, GB, MLP"}},
+      zlabel={\footnotesize + Metadata (Age, Sex)},
+      fill=\ClassifierColor, bandfill=\ClassifierColor,
+      height=16, width={15}, depth=10
+  }};
+  \draw [connection, dashed] (mu_used-east) -- node{\midarrow} (clf-west);
+  
+\end{tikzpicture}
+\end{document}
