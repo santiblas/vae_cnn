@@ -22,6 +22,8 @@ import seaborn as sns
 import shap
 import torch
 from typing import Optional
+import os
+import random
 
 try:
     from captum.attr import IntegratedGradients
@@ -35,7 +37,7 @@ except ImportError:
 try:
     from models.convolutional_vae2 import ConvolutionalVAE
 except ImportError as e:  # ayuda si se ejecuta fuera del repo raíz
-    raise ImportError("No se pudo importar ConvolutionalVAE desde models.convolutional_vae3.\n"
+    raise ImportError("No se pudo importar ConvolutionalVAE desde models.convolutional_vae2.\n"
                       "Asegúrate de ejecutar desde la raíz del proyecto o de que PYTHONPATH esté configurado.") from e
 
 # ---------------------------------------------------------------------------
@@ -45,6 +47,21 @@ logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
 log = logging.getLogger('interpret')
 logging.getLogger('shap').setLevel(logging.WARNING)
 
+# ---------------------------------------------------------------------------
+# Semillas
+# ---------------------------------------------------------------------------
+def _set_all_seeds(seed: int) -> None:
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    try:
+        import torch
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
+    except Exception: pass
+    random.seed(seed); np.random.seed(seed)
+ 
 # ---------------------------------------------------------------------------
 # Utilidades básicas
 # ---------------------------------------------------------------------------
@@ -183,6 +200,18 @@ def unwrap_model_for_shap(model: Any, clf_type: str) -> Any:
             return cc.base_estimator
     return model
 
+def _grad_to_signed_and_abs(grad_batch: torch.Tensor) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Recibe gradientes por-batch sobre la entrada (B,C,R,R) y devuelve:
+      - signed: media (con signo) sobre el batch, proyectada a simétrica y hueca.
+      - abs:    |signed|, también proyectada.
+    """
+    g = grad_batch.detach().mean(dim=0).cpu().numpy()  # (C,R,R)
+    signed = _project_to_H(g)
+    absmap = _project_to_H(np.abs(g))
+    return signed.astype(np.float32), absmap.astype(np.float32)
+
+
 
 def _to_sample_feature(sh_vals: Union[np.ndarray, List[np.ndarray]],
                        positive_idx: int,
@@ -302,6 +331,9 @@ def cmd_shap(args: argparse.Namespace) -> None:
 
     # Índices de test en el DataFrame CN/AD (orden como en entrenamiento)
     test_idx_in_cnad = np.load(fold_dir / 'test_indices.npy')
+    # Derivar índices de TRAIN para robustecer imputaciones de metadatos (sin fuga)
+    all_cnad_idx = np.arange(len(cnad))
+    train_idx_in_cnad = np.setdiff1d(all_cnad_idx, test_idx_in_cnad, assume_unique=True)
     test_df = cnad.iloc[test_idx_in_cnad].copy()
     gidx_test = test_df['tensor_idx'].values
 
@@ -323,12 +355,22 @@ def cmd_shap(args: argparse.Namespace) -> None:
     # Combinar latentes + metadatos para tener X_raw (features crudas)
     meta_cols = args.metadata_features or []
 
-    # ▼▼▼ LÍNEA AÑADIDA - LA SOLUCIÓN ▼▼▼
-    # Replicamos la codificación de la columna 'Sex' que se hizo en el script de entrenamiento.
+    # --- Robustez metadatos ---
+    test_df = test_df.copy()
     if 'Sex' in meta_cols:
-        test_df = test_df.copy()
-        test_df.loc[:, 'Sex'] = test_df['Sex'].map({'M': 0, 'F': 1, 'f': 1, 'm': 0})
-    # ▲▲▲ FIN DE LA SOLUCIÓN ▲▲▲
+        # map solo si es texto; si ya viene numérica, respetar
+        if test_df['Sex'].dtype == object:
+            test_df.loc[:, 'Sex'] = test_df['Sex'].map({'M': 0, 'F': 1, 'f': 1, 'm': 0})
+        test_df.loc[:, 'Sex'] = pd.to_numeric(test_df['Sex'], errors='coerce')
+        # imputación con la moda de TRAIN (0/1). Si no hay, caer al 0.
+        sex_train = pd.to_numeric(cnad.iloc[train_idx_in_cnad]['Sex'], errors='coerce')
+        sex_mode = sex_train.dropna().mode().iloc[0] if not sex_train.dropna().empty else 0.0
+        test_df.loc[:, 'Sex'] = test_df['Sex'].fillna(sex_mode).astype(float)
+    if 'Age' in meta_cols:
+        test_df.loc[:, 'Age'] = pd.to_numeric(test_df['Age'], errors='coerce')
+        age_train = pd.to_numeric(cnad.iloc[train_idx_in_cnad]['Age'], errors='coerce')
+        age_median = float(age_train.dropna().median()) if not age_train.dropna().empty else float(test_df['Age'].dropna().median())
+        test_df.loc[:, 'Age'] = test_df['Age'].fillna(age_median).astype(float)
 
     X_raw = pd.concat([X_lat.reset_index(drop=True),
                     test_df[meta_cols].reset_index(drop=True)], axis=1)
@@ -350,21 +392,11 @@ def cmd_shap(args: argparse.Namespace) -> None:
     feat_names, support = _safe_feature_names_after_preproc(preproc, raw_names, selector)
     X_proc_df = pd.DataFrame(X_proc, columns=feat_names)
 
-    # Detectar latentes a partir de los NOMBRES CRUDOS y arrastrar el selector
-    latent_mask_raw, latent_idx_raw, _latent_cols_raw = _find_latent_columns(raw_names)
-    if support is not None:
-        if latent_mask_raw.shape[0] == support.shape[0]:
-            latent_mask_proc = latent_mask_raw[support]
-            latent_idx_proc = [i for (i, keep) in zip(latent_idx_raw, latent_mask_raw[support][latent_mask_raw[support]])]
-        else:
-            # Si algo raro pasó, volvemos a detectar en los nombres finales
-            latent_mask_proc, latent_idx_proc, _ = _find_latent_columns(feat_names)
-    else:
-        # Sin selector, el mapa es el mismo
-        latent_mask_proc, latent_idx_proc = latent_mask_raw, latent_idx_raw
-
+    # Detectar latentes directamente en los NOMBRES FINALES (tras preproc/selector)
+    latent_mask_proc, latent_idx_proc, _ = _find_latent_columns(feat_names)
     # Por si los nombres "finales" no conservan 'latent_*', generamos nombres latentes canónicos
     latent_cols_proc = np.array([f"latent_{i}" for i in latent_idx_proc], dtype=object)
+
  
 
     if latent_mask_proc.sum() == 0:
@@ -417,18 +449,26 @@ def cmd_shap(args: argparse.Namespace) -> None:
         explainer = shap.TreeExplainer(model, background_proc)
         shap_all = explainer.shap_values(X_proc_df)
     else:
-        log.warning("[SHAP] Usando KernelExplainer (puede ser lento).")
-        
-        # ▼▼▼ INICIO DE LA SOLUCIÓN ▼▼▼
-        # Resumimos el background usando k-means para evitar el error de M > N.
-        # 50 centroides es un buen número para empezar.
-        log.info(f"[SHAP] Resumiendo el background de {len(background_proc)} muestras a 50 centroides para KernelExplainer.")
-        background_summary = shap.kmeans(background_proc, 50)
-        
-        explainer = shap.KernelExplainer(model.predict_proba, background_summary)
-        # ▲▲▲ FIN DE LA SOLUCIÓN ▲▲▲
-        
-        shap_all = explainer.shap_values(X_proc_df, nsamples=args.kernel_nsamples)
+        log.warning("[SHAP] Usando KernelExplainer con masker estable (si está disponible).")
+        # Resumimos el background para estabilidad y coste
+        k = min(50, len(background_proc))
+        np.random.seed(args.seed)
+        log.info(f"[SHAP] Resumiendo background de {len(background_proc)} → {k} centroides (kmeans).")
+        summary = shap.kmeans(background_proc, k)
+        # SHAP < 0.41: kmeans devuelve DenseData; quedarnos con .data (np.ndarray)
+        bg_np = getattr(summary, "data", summary)
+        # Explainer moderno con masker; si falla (versiones antiguas), fallback a KernelExplainer clásico
+        try:
+            masker = shap.maskers.Independent(bg_np)
+            explainer = shap.Explainer(model.predict_proba, masker, algorithm="kernel")
+            exp = explainer(X_proc_df.values, max_evals=args.kernel_nsamples)
+            shap_all = exp.values
+            base_val = exp.base_values
+        except Exception as e:
+            log.warning(f"[SHAP] shap.Explainer no disponible/compatible ({e}); fallback a KernelExplainer clásico.")
+            explainer = shap.KernelExplainer(model.predict_proba, bg_np)
+            shap_all = explainer.shap_values(X_proc_df.values, nsamples=args.kernel_nsamples)
+            base_val = explainer.expected_value
 
     # 9) Clase positiva y empaquetado
     classes_ = list(model.classes_) if hasattr(model, 'classes_') else [0, 1]
@@ -436,7 +476,10 @@ def cmd_shap(args: argparse.Namespace) -> None:
     pos_idx = classes_.index(pos_int)
     shap_pos = _to_sample_feature(shap_all, pos_idx, *X_proc_df.shape)
 
-    base_val = explainer.expected_value
+    # base_value ya resuelto arriba si usamos Explainer moderno; si venimos del
+    # árbol o KernelExplainer clásico, adaptar al formato (lista por clase)
+    if not isinstance(locals().get('base_val', None), (int, float, np.floating)):
+        base_val = explainer.expected_value
     if isinstance(base_val, (list, np.ndarray)):
         base_val = base_val[pos_idx]
 
@@ -452,6 +495,7 @@ def cmd_shap(args: argparse.Namespace) -> None:
         'test_labels': test_df['ResearchGroup_Mapped'].map({'CN': 0, 'AD': 1}).astype(int).tolist(),
         'latent_features_type': args.latent_features_type,
         'metadata_features': meta_cols,
+        'seed_used': int(args.seed),
     }
     pack_path = out_dir / f'shap_pack_{args.clf}.joblib'
     joblib.dump(pack, pack_path)
@@ -498,8 +542,18 @@ def get_latent_weights_from_pack(pack: Dict[str, Any], mode: str, top_k: Optiona
     feature_names = pack['feature_names']        # list len=F
     labels = np.asarray(pack['test_labels'])     # (N,)
 
-    import re
-    latent_mask = np.array([bool(re.search(r'(?:^|__)latent_\d+$', n)) for n in feature_names])
+    # Preferir la máscara latente guardada en el pack (más robusta);
+    # si no existe, fallback regex.
+    if 'latent_feature_mask' in pack and isinstance(pack['latent_feature_mask'], (list, np.ndarray)):
+        latent_mask = np.asarray(pack['latent_feature_mask'], dtype=bool)
+        # Alinear por seguridad si la longitud difiere
+        if latent_mask.shape[0] != len(feature_names):
+            log.warning("[SALIENCY] Máscara latente del pack no alinea; se usará fallback regex.")
+            import re
+            latent_mask = np.array([bool(re.search(r'(?:^|__)latent_\d+$', n)) for n in feature_names])
+    else:
+        import re
+        latent_mask = np.array([bool(re.search(r'(?:^|__)latent_\d+$', n)) for n in feature_names])
 
     latent_vals = shap_values[:, latent_mask]
     latent_names = np.array(feature_names)[latent_mask]
@@ -562,12 +616,10 @@ def generate_saliency_vectorized(vae_model: ConvolutionalVAE,
                                  weights_df: pd.DataFrame,
                                  input_tensor: torch.Tensor,
                                  device: torch.device) -> np.ndarray:
-    """Genera mapa de saliencia promediando gradientes absolutos sobre batch.
-
-    Devuelve array (C, R, R) en CPU numpy.
-    """
+    """Genera saliencia devolviendo (signed, abs), ambos (C,R,R)."""
     if input_tensor.numel() == 0:
-        return np.zeros((vae_model.input_channels, vae_model.image_size, vae_model.image_size), dtype=np.float32)
+        z = np.zeros((vae_model.input_channels, vae_model.image_size, vae_model.image_size), dtype=np.float32)
+        return z, z
 
     vae_model.eval()
     x = input_tensor.clone().detach().to(device)
@@ -586,9 +638,8 @@ def generate_saliency_vectorized(vae_model: ConvolutionalVAE,
         mu, _ = vae_model.encode(x)  # shape (B, latent_dim)
         mu.backward(gradient=w)
 
-    sal = x.grad.detach().abs().mean(dim=0).cpu().numpy()  # (C,R,R)
-
-    return _project_to_H(sal)
+    signed, absmap = _grad_to_signed_and_abs(x.grad)
+    return signed, absmap
 
 
 def generate_saliency_smoothgrad(vae_model: ConvolutionalVAE,
@@ -597,22 +648,25 @@ def generate_saliency_smoothgrad(vae_model: ConvolutionalVAE,
                                  device: torch.device,
                                  n_samples: int = 10,
                                  noise_std_perc: float = 0.15) -> np.ndarray:
-    """Genera mapa de saliencia con SmoothGrad."""
+    """Genera (signed, abs) con SmoothGrad."""
     if input_tensor.numel() == 0:
-        return np.zeros((vae_model.input_channels, vae_model.image_size, vae_model.image_size), dtype=np.float32)
+        z = np.zeros((vae_model.input_channels, vae_model.image_size, vae_model.image_size), dtype=np.float32)
+        return z, z
 
     input_std = torch.std(input_tensor)
     noise_std = input_std * noise_std_perc
     
-    total_saliency = np.zeros((vae_model.input_channels, vae_model.image_size, vae_model.image_size), dtype=np.float32)
-    
+    total_signed = np.zeros((vae_model.input_channels, vae_model.image_size, vae_model.image_size), dtype=np.float32)
+    total_abs    = np.zeros_like(total_signed)
+
     for _ in range(n_samples):
         noise = torch.randn_like(input_tensor) * noise_std
         noisy_input = input_tensor + noise
-        saliency = generate_saliency_vectorized(vae_model, weights_df, noisy_input, device)
-        total_saliency += saliency
+        s, a = generate_saliency_vectorized(vae_model, weights_df, noisy_input, device)
+        total_signed += s
+        total_abs    += a
 
-    return total_saliency / n_samples
+    return total_signed / n_samples, total_abs / n_samples
 
 
 def generate_saliency_integrated_gradients(vae_model: ConvolutionalVAE,
@@ -621,10 +675,10 @@ def generate_saliency_integrated_gradients(vae_model: ConvolutionalVAE,
                                            device: torch.device,
                                            baseline: Optional[torch.Tensor] = None,
                                            n_steps: int = 50) -> np.ndarray:
-    """Genera mapa de saliencia con Integrated Gradients usando Captum."""
+    """Genera (signed, abs) con Integrated Gradients (Captum)."""
     if input_tensor.numel() == 0:
-        return np.zeros((vae_model.input_channels, vae_model.image_size, vae_model.image_size), dtype=np.float32)
-
+        z = np.zeros((vae_model.input_channels, vae_model.image_size, vae_model.image_size), dtype=np.float32)
+        return z, z
     if IntegratedGradients is None:
         raise ImportError("Captum no está instalado. No se puede usar 'integrated_gradients'.")
 
@@ -656,11 +710,10 @@ def generate_saliency_integrated_gradients(vae_model: ConvolutionalVAE,
         baselines = b
 
     attributions = ig.attribute(input_tensor.to(device), baselines=baselines, n_steps=n_steps)
-
-
-    
-    sal = attributions.abs().mean(dim=0).cpu().numpy() # Promedio sobre batch
-    return _project_to_H(sal)
+    A = attributions.mean(dim=0).cpu().numpy()
+    signed = _project_to_H(A)
+    absmap = _project_to_H(np.abs(A))
+    return signed.astype(np.float32), absmap.astype(np.float32)
 
 
 def _ensure_background_processed(
@@ -780,6 +833,8 @@ def _plot_shap_summary(shap_pos: np.ndarray,
 
 
 def cmd_saliency(args: argparse.Namespace) -> None:
+    # Semillas para reproducibilidad también en la etapa de saliencia
+    _set_all_seeds(args.seed)
     fold_dir = Path(args.run_dir) / f"fold_{args.fold}"
     shap_dir = fold_dir / 'interpretability_shap'
     pack_path = shap_dir / f'shap_pack_{args.clf}.joblib'
@@ -899,10 +954,11 @@ def cmd_saliency(args: argparse.Namespace) -> None:
         np.save(out_dir / f"ig_baseline_{args.ig_baseline}.npy",
                 (ig_baseline_tensor.cpu().numpy() if ig_baseline_tensor is not None else np.zeros_like(tens_test_t[0].cpu().numpy())))
 
-
-    sal_ad = saliency_fn(vae, weights_df, x_ad, device)
-    sal_cn = saliency_fn(vae, weights_df, x_cn, device)
-    sal_diff = sal_ad - sal_cn
+    sal_ad_signed, sal_ad_abs = saliency_fn(vae, weights_df, x_ad, device)
+    sal_cn_signed, sal_cn_abs = saliency_fn(vae, weights_df, x_cn, device)
+    sal_diff_signed = sal_ad_signed - sal_cn_signed
+    # diferencia en sentido signed; la variante abs se define como |diff_signed|
+    sal_diff_abs = np.abs(sal_diff_signed)
 
     # Guardar mapas ------------------------------------------------------------
     out_dir = fold_dir / f"interpretability_{args.clf}"
@@ -910,12 +966,18 @@ def cmd_saliency(args: argparse.Namespace) -> None:
     method_tag = "" if args.saliency_method == "vanilla" else f"_{args.saliency_method}"
     file_suffix = f"{method_tag}_top{args.top_k}"
 
-    np.save(out_dir / f"saliency_map_ad{file_suffix}.npy", sal_ad)
-    np.save(out_dir / f"saliency_map_cn{file_suffix}.npy", sal_cn)
-    np.save(out_dir / f"saliency_map_diff{file_suffix}.npy", sal_diff)
+    # Grabar por grupo y diferencial (signed y abs)
+    np.save(out_dir / f"saliency_map_ad_signed{file_suffix}.npy",  sal_ad_signed)
+    np.save(out_dir / f"saliency_map_ad_abs{file_suffix}.npy",     sal_ad_abs)
+    np.save(out_dir / f"saliency_map_cn_signed{file_suffix}.npy",  sal_cn_signed)
+    np.save(out_dir / f"saliency_map_cn_abs{file_suffix}.npy",     sal_cn_abs)
+    np.save(out_dir / f"saliency_map_diff_signed{file_suffix}.npy", sal_diff_signed)
+    np.save(out_dir / f"saliency_map_diff_abs{file_suffix}.npy",    sal_diff_abs)
+ 
 
     _ranking_and_heatmap(
-        saliency_map_diff=sal_diff,
+        saliency_map_diff_signed=sal_diff_signed,
+        saliency_map_diff_abs=sal_diff_abs,
         roi_map_df=roi_map_df,
         roi_names=roi_names,
         out_dir=out_dir,
@@ -926,10 +988,10 @@ def cmd_saliency(args: argparse.Namespace) -> None:
     )
 
     # ===== NEW =====
-    # (1) Per-channel contributions from differential saliency map
-    sal_diff_np = sal_diff  # (C,R,R)
-    l1 = np.abs(sal_diff_np).sum(axis=(1,2))  # L1 por canal
-    frac = l1 / (l1.sum() + 1e-12)           # fracción relativa
+    # (1) Contribución por canal desde el mapa diferencial
+    l1_abs = sal_diff_abs.sum(axis=(1,2))  # L1 (abs)
+    l1_sgn = np.sign(sal_diff_signed).sum(axis=(1,2))  # suma de signos (diagnóstico)
+    frac_abs = l1_abs / (l1_abs.sum() + 1e-12)          # fracción relativa
     # nombres de canales (si el usuario los pasa, usarlos; si no, usar índices)
     ch_used = list(args.channels_to_use)
     if getattr(args, "channel_names", None) and len(args.channel_names) == len(ch_used):
@@ -940,8 +1002,9 @@ def cmd_saliency(args: argparse.Namespace) -> None:
     chan_df = pd.DataFrame({
         'channel_index_used': ch_used,
         'channel_name': ch_names,
-        'l1_norm': l1,
-        'l1_norm_fraction': frac
+        'l1_norm_abs': l1_abs,
+        'l1_norm_fraction_abs': frac_abs,
+        'signed_sum': l1_sgn
     })
     # Guardar con y sin sufijo para que el notebook lo encuentre directo
     chan_csv_suff = out_dir / f'channel_contributions{file_suffix}.csv'
@@ -949,7 +1012,7 @@ def cmd_saliency(args: argparse.Namespace) -> None:
     chan_df.to_csv(chan_csv_suff, index=False)
     chan_df.to_csv(chan_csv_nosuff, index=False)
 
-    plt.figure(figsize=(6,4)); plt.bar(np.arange(len(l1)), frac)
+    plt.figure(figsize=(6,4)); plt.bar(np.arange(len(l1_abs)), frac_abs)
     plt.xlabel('Channel'); plt.ylabel('Fraction of total |ΔSal|')
     plt.title(f'Channel contributions – fold {args.fold}'); plt.tight_layout()
     plt.savefig(out_dir / f'channel_contributions{file_suffix}.png', dpi=150)
@@ -967,9 +1030,9 @@ def cmd_saliency(args: argparse.Namespace) -> None:
         pos = {n:i for i,n in enumerate(nets)}
         M_abs = np.zeros((len(nets),len(nets)), float)
         M_sgn = np.zeros_like(M_abs)
-        for _,r in df_edges.iterrows():
+        for _, r in df_edges.iterrows():
             i = pos[str(r[net_src_col])]; j = pos[str(r[net_dst_col])]
-            v = float(r['Saliency_Score']); a = abs(v)
+            v = float(r['Saliency_Signed']); a = float(r['Saliency_Abs'])
             M_abs[i,j]+=a; M_abs[j,i]+=a; M_sgn[i,j]+=v; M_sgn[j,i]+=v
         pd.DataFrame(M_abs, index=nets, columns=nets).to_csv(out_dir / f'network_pairs_sumabs{file_suffix}.csv', index=True)
         pd.DataFrame(M_sgn, index=nets, columns=nets).to_csv(out_dir / f'network_pairs_signed{file_suffix}.csv', index=True)
@@ -990,8 +1053,11 @@ def cmd_saliency(args: argparse.Namespace) -> None:
             sub = df_edges[df_edges['Rank']<=K].copy()
             nodes = sorted(set(sub['src_AAL3_Name'].astype(str)) | set(sub['dst_AAL3_Name'].astype(str)))
             deg = {n:0 for n in nodes}; strg = {n:0.0 for n in nodes}
-            for _,r in sub.iterrows():
-                a=str(r['src_AAL3_Name']); b=str(r['dst_AAL3_Name']); w=abs(float(r['Saliency_Score']))
+            for _, r in sub.iterrows():
+                a = str(r['src_AAL3_Name']); b = str(r['dst_AAL3_Name'])
+                # usar Saliency_Abs si existe; si no, caer a |Saliency_Signed|
+                col = 'Saliency_Abs' if 'Saliency_Abs' in r else 'Saliency_Signed'
+                w = float(abs(r[col]))
                 deg[a]+=1; deg[b]+=1; strg[a]+=w; strg[b]+=w
             # Construir tabla y residualizar fuerza respecto a grado
             tab = pd.DataFrame({
@@ -1021,7 +1087,8 @@ def cmd_saliency(args: argparse.Namespace) -> None:
 # Ranking + visualización
 # ---------------------------------------------------------------------------
 
-def _ranking_and_heatmap(saliency_map_diff: np.ndarray,
+def _ranking_and_heatmap(saliency_map_diff_signed: np.ndarray,
+                         saliency_map_diff_abs: np.ndarray,
                          roi_map_df: Optional[pd.DataFrame],
                          roi_names: Sequence[str],
                          out_dir: Path,
@@ -1030,15 +1097,17 @@ def _ranking_and_heatmap(saliency_map_diff: np.ndarray,
                          top_k: int,
                          annot_df: Optional[pd.DataFrame] = None,
                          method_tag: str = "") -> None:
-    # saliency_map_diff: (C,R,R) → promediamos sobre canales
-    sal_m = saliency_map_diff.mean(axis=0)
-    n_rois = sal_m.shape[0]
+    # Ambos (C,R,R) → promediamos sobre canales
+    sal_m_sgn = saliency_map_diff_signed.mean(axis=0)
+    sal_m_abs = saliency_map_diff_abs.mean(axis=0)
+    n_rois = sal_m_sgn.shape[0]
     # Crear la tabla de conexiones con índices numéricos
     ut_indices = np.triu_indices(n_rois, k=1)
     df_edges = pd.DataFrame({
         'idx_i': ut_indices[0],
         'idx_j': ut_indices[1],
-        'Saliency_Score': sal_m[ut_indices]
+        'Saliency_Signed': sal_m_sgn[ut_indices],
+        'Saliency_Abs':    sal_m_abs[ut_indices]
     })
     # <NUEVO> Anotar el DataFrame de conexiones si el mapa de ROIs está disponible
     if roi_map_df is not None:
@@ -1073,8 +1142,7 @@ def _ranking_and_heatmap(saliency_map_diff: np.ndarray,
             df_edges['dst_Yeo17_Network'] = df_edges['idx_j'].map(y17_map)      
 
 
-    df_edges['Saliency_Magnitude'] = df_edges['Saliency_Score'].abs()
-    df_edges = df_edges.sort_values('Saliency_Magnitude', ascending=False).drop(columns='Saliency_Magnitude')
+    df_edges = df_edges.sort_values('Saliency_Abs', ascending=False)
     df_edges.insert(0, 'Rank', range(1, len(df_edges) + 1))
     file_suffix = f"{method_tag}_top{top_k}"
     edge_csv_path = out_dir / f"ranking_conexiones_ANOTADO{file_suffix}.csv"
@@ -1091,14 +1159,18 @@ def _ranking_and_heatmap(saliency_map_diff: np.ndarray,
                     .rename(columns={'Macro_Lobe':'Lobe_j','Refined_Network':'Network_j'})
                     .drop(columns='AAL3_Name'))
     # preview top 20
-    preview_cols = ['Rank', 'src_AAL3_Name', 'dst_AAL3_Name', 'Saliency_Score', 'src_Refined_Network', 'dst_Refined_Network']
+    preview_cols = [
+        'Rank', 'src_AAL3_Name', 'dst_AAL3_Name', 'Saliency_Signed', 'Saliency_Abs',
+        'src_Refined_Network', 'dst_Refined_Network'
+    ]
     preview_cols_exist = [c for c in preview_cols if c in df_edges.columns]
     log.info("Top 20 conexiones anotadas:\n" + df_edges.head(20)[preview_cols_exist].to_string())
+ 
  
 
     # heatmap
     plt.figure(figsize=(12, 10))
-    sns.heatmap(sal_m, cmap='coolwarm', center=0,
+    sns.heatmap(sal_m_sgn, cmap='coolwarm', center=0,
                 xticklabels=list(roi_names)[:n_rois], yticklabels=list(roi_names)[:n_rois],
                 cbar_kws={'label': 'Saliencia Diferencial (AD > CN)'} )
     plt.title(f'Mapa de Saliencia Diferencial (AD vs CN) - Fold {fold} - {clf.upper()}{method_tag.replace("_", " ").title()}')
@@ -1122,6 +1194,7 @@ def _add_shared_args(p: argparse.ArgumentParser) -> None:
     p.add_argument('--latent_features_type', choices=['mu','z'], default='mu', help='Usar mu o z como features latentes.')
     p.add_argument('--metadata_features', nargs='*', default=None, help='Columnas de metadatos añadidas al clasificador.')
     # Arquitectura VAE
+    p.add_argument('--seed', type=int, default=42, help='Semilla global para numpy/torch/shap.')
     p.add_argument('--num_conv_layers_encoder', type=int, default=4)
     p.add_argument('--decoder_type', default='convtranspose', choices=['convtranspose','upsample_conv'])
     p.add_argument('--dropout_rate_vae', type=float, default=0.2)
@@ -1142,6 +1215,7 @@ def parse_args() -> argparse.Namespace:
     # subcomando SHAP ---------------------------------------------------------
     p_shap = sub.add_parser('shap', help='Calcular y guardar valores SHAP para un fold+clf.')
     _add_shared_args(p_shap)
+
     p_shap.add_argument('--roi_order_path', default=None, help='(Opcional) ruta a ROI order si no está en run_dir.')
     p_shap.add_argument('--kernel_nsamples', type=int, default=100, help='nsamples para KernelExplainer (modelos no tree).')
 
@@ -1177,6 +1251,9 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    # Semillas globales también aquí (por si algún camino llama antes)
+    if hasattr(args, 'seed'):
+        _set_all_seeds(int(args.seed))
     if args.cmd == 'shap':
         cmd_shap(args)
     elif args.cmd == 'saliency':
