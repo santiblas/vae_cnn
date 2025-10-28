@@ -136,7 +136,7 @@ def get_classifier_and_grid(
     n_iter_search = 150
 
     if ctype == 'svm':
-        model = SVC(probability=True, random_state=seed, class_weight=class_weight, cache_size=500)
+        model = SVC(probability=False, random_state=seed, class_weight=class_weight, cache_size=500)
         param_distributions = {
             'model__C': FloatDistribution(1, 1e4, log=True), 
             'model__gamma': FloatDistribution(1e-7, 1e-3, log=True),
