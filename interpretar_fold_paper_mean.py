@@ -24,6 +24,7 @@ import torch
 from typing import Optional
 import os
 import random
+from sklearn.preprocessing import FunctionTransformer
 
 try:
     from captum.attr import IntegratedGradients
@@ -53,13 +54,13 @@ logging.getLogger('shap').setLevel(logging.WARNING)
 def _set_all_seeds(seed: int) -> None:
     os.environ['PYTHONHASHSEED'] = str(seed)
     try:
-        import torch
         torch.manual_seed(seed)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(seed)
             torch.backends.cudnn.deterministic = True
             torch.backends.cudnn.benchmark = False
-    except Exception: pass
+    except Exception:
+        pass
     random.seed(seed); np.random.seed(seed)
  
 # ---------------------------------------------------------------------------
@@ -168,6 +169,44 @@ def _build_background_from_train(
 
     return X_bg_raw
 
+def _pick_bg_indices(cnad_df: pd.DataFrame,
+                     train_idx_in_cnad: np.ndarray,
+                     mode: str, sample_size: int, seed: int) -> np.ndarray:
+    if mode == 'train':
+        pool = np.asarray(train_idx_in_cnad)
+    elif mode == 'global':
+        pool = np.arange(len(cnad_df))
+    elif mode == 'global_cn':
+        pool = cnad_df.index[cnad_df['ResearchGroup_Mapped'].astype(str).isin(['CN'])].to_numpy()
+    else:
+        raise ValueError(f"bg_mode desconocido: {mode}")
+    rng = np.random.RandomState(seed)
+    if pool.size > sample_size:
+        return np.sort(rng.choice(pool, size=sample_size, replace=False))
+    return np.sort(pool)
+
+def _build_background_from_indices(
+    *, idx_in_cnad: np.ndarray, cnad_df: pd.DataFrame, tensor_all: np.ndarray, channels: Sequence[int],
+    norm_params: List[Dict[str, float]], meta_cols: List[str], vae: ConvolutionalVAE,
+    device: torch.device
+) -> pd.DataFrame:
+    """Reconstruye background RAW (latentes + metadatos) usando índices absolutos del DF CN/AD."""
+    if idx_in_cnad.size == 0:
+        raise RuntimeError("Índices para background vacíos.")
+    df = cnad_df.iloc[idx_in_cnad].copy()
+    gidx = df['tensor_idx'].values
+    tens = tensor_all[gidx][:, channels, :, :]
+    tens = apply_normalization_params(tens, norm_params)
+    with torch.no_grad():
+        _, mu, _, z = vae(torch.from_numpy(tens).float().to(device))
+    lat_np = mu.detach().cpu().numpy()
+    lat_cols = [f'latent_{i}' for i in range(lat_np.shape[1])]
+    X_lat = pd.DataFrame(lat_np, columns=lat_cols)
+    if 'Sex' in meta_cols:
+        df.loc[:, 'Sex'] = df['Sex'].map({'M':0,'F':1,'m':0,'f':1})
+    return pd.concat([X_lat.reset_index(drop=True),
+                      df[meta_cols].reset_index(drop=True)], axis=1)
+
 def clean_state_dict(sd: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
     """Elimina el prefijo "_orig_mod." que añade torch.compile."""
     return {k.replace('_orig_mod.', ''): v for k, v in sd.items()}
@@ -191,8 +230,8 @@ def _project_to_H(sal_map: np.ndarray) -> np.ndarray:
 
 
 def unwrap_model_for_shap(model: Any, clf_type: str) -> Any:
-    """Extrae el estimador base de un CalibratedClassifierCV cuando aplica."""
-    if hasattr(model, 'calibrated_classifiers_') and clf_type in {'xgb', 'gb', 'rf', 'lgbm'}:
+    """Extrae el estimador base de un CalibratedClassifierCV cuando aplica (para cualquier clf)."""
+    if hasattr(model, 'calibrated_classifiers_'):
         cc = model.calibrated_classifiers_[0]
         if hasattr(cc, 'estimator') and cc.estimator is not None:
             return cc.estimator
@@ -369,16 +408,69 @@ def cmd_shap(args: argparse.Namespace) -> None:
     if 'Age' in meta_cols:
         test_df.loc[:, 'Age'] = pd.to_numeric(test_df['Age'], errors='coerce')
         age_train = pd.to_numeric(cnad.iloc[train_idx_in_cnad]['Age'], errors='coerce')
-        age_median = float(age_train.dropna().median()) if not age_train.dropna().empty else float(test_df['Age'].dropna().median())
-        test_df.loc[:, 'Age'] = test_df['Age'].fillna(age_median).astype(float)
+        if not age_train.dropna().empty:
+            age_mean = float(age_train.dropna().mean())
+        else:
+            # fallback a la media del propio test_df si existe, si no usar un valor sensato
+            if not test_df['Age'].dropna().empty:
+                age_mean = float(test_df['Age'].dropna().mean())
+            else:
+                age_mean = 70.0
+        test_df.loc[:, 'Age'] = test_df['Age'].fillna(age_mean).astype(float)
 
-    X_raw = pd.concat([X_lat.reset_index(drop=True),
-                    test_df[meta_cols].reset_index(drop=True)], axis=1)
+    # --- [NUEVO] Logica para "congelar" metadatos (Drop-in 1) ---
+    if args.freeze_meta:
+        test_df_freeze = test_df.copy()
+        freeze_values = {}
+        if args.freeze_strategy == 'train_stats':
+            if 'Age' in args.freeze_meta and 'Age' in test_df_freeze.columns:
+                age_train = pd.to_numeric(cnad.iloc[train_idx_in_cnad]['Age'], errors='coerce')
+                age_med = float(age_train.dropna().median()) if not age_train.dropna().empty else float(test_df_freeze['Age'].dropna().median() if not test_df_freeze['Age'].dropna().empty else 70.0)
+                test_df_freeze.loc[:, 'Age'] = age_med
+                freeze_values['Age'] = age_med
+            if 'Sex' in args.freeze_meta and 'Sex' in test_df_freeze.columns:
+                # Re-usar la logica de conversion de string a numerico si es necesario
+                sex_train_series = cnad.iloc[train_idx_in_cnad]['Sex']
+                # map a {M:0, F:1} y numérico
+                sex_train = (pd.to_numeric(
+                    sex_train_series.map({'M':0,'F':1,'m':0,'f':1}) if sex_train_series.dtype==object else sex_train_series,
+                    errors='coerce'))
+                sex_mean = float(sex_train.dropna().mean()) if not sex_train.dropna().empty else 0.5
+                test_df_freeze.loc[:, 'Sex'] = sex_mean
+                freeze_values['Sex'] = sex_mean
+        else:  # constants
+            if 'Age' in args.freeze_meta and 'Age' in test_df_freeze.columns:
+                test_df_freeze.loc[:, 'Age'] = 70.0
+                freeze_values['Age'] = 70.0
+            if 'Sex' in args.freeze_meta and 'Sex' in test_df_freeze.columns:
+                test_df_freeze.loc[:, 'Sex'] = 0.0
+                freeze_values['Sex'] = 0.0
+        
+
+        X_raw = pd.concat([X_lat.reset_index(drop=True),
+                            test_df_freeze[meta_cols].reset_index(drop=True)], axis=1)
+        log.info(f"[SHAP] META congelado para {args.freeze_meta} ({args.freeze_strategy}).")
+    else:
+        X_raw = pd.concat([X_lat.reset_index(drop=True),
+                            test_df[meta_cols].reset_index(drop=True)], axis=1)
+    # --- [FIN] Drop-in 1 ---
     log.info(f"[SHAP] X_raw (test) shape={X_raw.shape} (latentes + {len(meta_cols)} metadatos)")
 
+
     # 6) Preprocesamiento del pipeline (ya fitted) + nombres robustos
-    preproc = pipe.named_steps['scaler']
-    selector = pipe.named_steps.get("feature_select") or pipe.named_steps.get("fs")
+    # --- Extraer preproc/selector de forma robusta ---
+    preproc = (pipe.named_steps.get('preproc')
+               or pipe.named_steps.get('transformer')
+               or pipe.named_steps.get('features')
+               or pipe.named_steps.get('prep')
+               or pipe.named_steps.get('scaler'))
+    # identity si es None o 'passthrough'
+    if preproc is None or preproc == 'passthrough':
+        preproc = FunctionTransformer(validate=False)
+
+    selector = (pipe.named_steps.get("feature_selector")
+                or pipe.named_steps.get("feature_select")
+                or pipe.named_steps.get("fs"))
 
     # Guardamos nombres crudos antes de preprocesar
     raw_names = np.array(list(map(str, X_raw.columns)))
@@ -409,79 +501,143 @@ def cmd_shap(args: argparse.Namespace) -> None:
 
 
     # 7) Background: cargar o construir AHORA (ya existen cnad, tensor_all, norm_params, vae, device, preproc, selector, feat_names)
-    bg_path_raw = fold_dir / f"shap_background_raw_{args.clf}.joblib"
-    bg_path_processed = fold_dir / f"shap_background_data_{args.clf}.joblib"
+    bg_path_raw = fold_dir / f"shap_background_raw_{args.clf}_{args.bg_mode}.joblib"
+    bg_path_proc = fold_dir / f"shap_background_proc_{args.clf}_{args.bg_mode}.joblib"
 
-    if bg_path_raw.exists():
-        log.info(f"[SHAP] Cargando background RAW desde: {bg_path_raw.name}")
-        background_data = joblib.load(bg_path_raw)
-    elif bg_path_processed.exists():
-        log.warning(f"[SHAP] No hay RAW; uso el procesado: {bg_path_processed.name}")
-        background_data = joblib.load(bg_path_processed)
+    if bg_path_proc.exists() and not args.freeze_meta:
+        log.info(f"[SHAP] Cargando background PROCESADO (cache): {bg_path_proc.name}")
+        background_proc = joblib.load(bg_path_proc)
     else:
-        log.warning("[SHAP] No hay background en disco. Construyendo uno desde TRAIN…")
-        background_data = _build_background_from_train(
-            fold_dir=fold_dir,
-            cnad_df=cnad,
-            tensor_all=tensor_all,
-            channels=args.channels_to_use,
-            norm_params=norm_params,
-            meta_cols=meta_cols,
-            vae=vae,
-            device=device,
-            preproc=preproc,
-            selector=selector,
-            feat_names_target=feat_names,
-            sample_size=min(100, len(cnad))
-        )
-        joblib.dump(background_data, bg_path_processed)
-        log.info(f"[SHAP] Background procesado guardado en {bg_path_processed.name}")
-
-    # Asegurar que el background tenga mismas columnas/orden que el clasificador
-    background_proc = _ensure_background_processed(background_data, preproc, feat_names, selector)
+        # 🔁 Reconstrucción coherente desde RAW (si hay freeze_meta o no existe cache)
+        if bg_path_raw.exists():
+            log.info(f"[SHAP] Cargando background RAW: {bg_path_raw.name}")
+            background_raw = joblib.load(bg_path_raw)
+        else:
+            log.info(f"[SHAP] No hay background RAW. Construyendo con bg_mode={args.bg_mode}…")
+            all_cnad_idx = np.arange(len(cnad))
+            train_idx_in_cnad = np.setdiff1d(all_cnad_idx, test_idx_in_cnad, assume_unique=True)
+            idx_bg = _pick_bg_indices(cnad, train_idx_in_cnad,
+                                      mode=args.bg_mode,
+                                      sample_size=min(args.bg_sample_size, len(cnad)),
+                                      seed=args.bg_seed)
+            background_raw = _build_background_from_indices(
+                idx_in_cnad=idx_bg, cnad_df=cnad, tensor_all=tensor_all,
+                channels=args.channels_to_use, norm_params=norm_params,
+                meta_cols=meta_cols, vae=vae, device=device
+            )
+        # 🧊 Aplicar freeze SIEMPRE en RAW y luego transformar
+        if args.freeze_meta:
+            for k, v in freeze_values.items():
+                if k in background_raw.columns:
+                    background_raw.loc[:, k] = v
+        joblib.dump(background_raw, bg_path_raw)
+        background_proc = _ensure_background_processed(background_raw, preproc, feat_names, selector)
+        joblib.dump(background_proc, bg_path_proc)
+        log.info(f"[SHAP] Background RAW → {bg_path_raw.name}; PROCESADO → {bg_path_proc.name}")
 
     # 8) Modelo a explicar y SHAP
     model = unwrap_model_for_shap(pipe.named_steps['model'], args.clf)
+    # Determinar la clase positiva e índice ANTES de crear el explainer (evita NameError)
+    classes_src = pipe.named_steps['model']
+    classes_ = list(getattr(classes_src, 'classes_', getattr(model, 'classes_', [0,1])))
+    pos_int = label_info['positive_label_int']
+    pos_idx = classes_.index(pos_int) if pos_int in classes_ else (1 if len(classes_) > 1 else 0)
+
+    def _predict_linked(X):
+        model_step = pipe.named_steps['model']
+        # 1) Si hay predict_proba, úsalo
+        if hasattr(model_step, "predict_proba"):
+            proba = model_step.predict_proba(X)[:, pos_idx]
+            if args.shap_link == 'logit':
+                eps = 1e-6
+                p = np.clip(proba, eps, 1 - eps)
+                return np.log(p / (1 - p))
+            return proba
+        # 2) Si no, intentar con decision_function (margen)
+        if hasattr(model_step, "decision_function"):
+            margin = model_step.decision_function(X)
+            if isinstance(margin, np.ndarray) and margin.ndim == 2:
+                margin = margin[:, pos_idx]
+            # Para 'logit' devolvemos directamente el margen (escala similar a logit)
+            if args.shap_link == 'logit':
+                return margin
+            # Para 'identity' devolvemos sigmoide(margen) como aproximación a prob
+            return 1.0 / (1.0 + np.exp(-margin))
+        # 3) Último recurso: predict() → float
+        return model_step.predict(X).astype(float)
+
+
 
     # Bloque corregido para interpretar_fold_paper.py
+    # Bloque para elegir el explicador SHAP (alrededor de la línea 660)
+
+    base_val = None # Inicializamos por si acaso
 
     if args.clf in {'xgb', 'gb', 'rf', 'lgbm'}:
+        log.info(f"[SHAP] Usando TreeExplainer para {args.clf}.")
         explainer = shap.TreeExplainer(model, background_proc)
         shap_all = explainer.shap_values(X_proc_df)
+        base_val = explainer.expected_value
+
+    elif (args.clf == 'logreg') or (
+        args.clf == 'svm' and getattr(model, 'kernel', 'linear') == 'linear' and hasattr(model, 'coef_')
+    ):
+        log.info("[SHAP] Usando LinearExplainer para modelo lineal.")
+        explainer = shap.LinearExplainer(model, background_proc)
+        shap_all = explainer.shap_values(X_proc_df)
+        base_val = explainer.expected_value
+
     else:
-        log.warning("[SHAP] Usando KernelExplainer con masker estable (si está disponible).")
-        # Resumimos el background para estabilidad y coste
+        log.info("[SHAP] Usando KernelExplainer (controlado por --kernel_nsamples).")
         k = min(50, len(background_proc))
         np.random.seed(args.seed)
         log.info(f"[SHAP] Resumiendo background de {len(background_proc)} → {k} centroides (kmeans).")
-        summary = shap.kmeans(background_proc, k)
-        # SHAP < 0.41: kmeans devuelve DenseData; quedarnos con .data (np.ndarray)
+        bg_array = background_proc.values if isinstance(background_proc, pd.DataFrame) else np.asarray(background_proc)
+        summary = shap.kmeans(bg_array, k)
         bg_np = getattr(summary, "data", summary)
-        # Explainer moderno con masker; si falla (versiones antiguas), fallback a KernelExplainer clásico
-        try:
-            masker = shap.maskers.Independent(bg_np)
-            explainer = shap.Explainer(model.predict_proba, masker, algorithm="kernel")
-            exp = explainer(X_proc_df.values, max_evals=args.kernel_nsamples)
-            shap_all = exp.values
-            base_val = exp.base_values
-        except Exception as e:
-            log.warning(f"[SHAP] shap.Explainer no disponible/compatible ({e}); fallback a KernelExplainer clásico.")
-            explainer = shap.KernelExplainer(model.predict_proba, bg_np)
-            shap_all = explainer.shap_values(X_proc_df.values, nsamples=args.kernel_nsamples)
-            base_val = explainer.expected_value
+        explainer = shap.KernelExplainer(_predict_linked, bg_np)
+        shap_all = explainer.shap_values(X_proc_df.values, nsamples=args.kernel_nsamples)
+        base_val = explainer.expected_value
+
 
     # 9) Clase positiva y empaquetado
-    classes_ = list(model.classes_) if hasattr(model, 'classes_') else [0, 1]
-    pos_int = label_info['positive_label_int']
-    pos_idx = classes_.index(pos_int)
     shap_pos = _to_sample_feature(shap_all, pos_idx, *X_proc_df.shape)
 
-    # base_value ya resuelto arriba si usamos Explainer moderno; si venimos del
-    # árbol o KernelExplainer clásico, adaptar al formato (lista por clase)
-    if not isinstance(locals().get('base_val', None), (int, float, np.floating)):
-        base_val = explainer.expected_value
-    if isinstance(base_val, (list, np.ndarray)):
+    # --- NORMALIZACIÓN POST-HOC ENTRE FOLDS (opcional) ---
+    if args.shap_normalize != 'none':
+        if args.shap_normalize == 'by_logit_median':
+            # usar misma definición que el explainer para f(x)
+            f = _predict_linked(X_proc_df)
+            diff = np.abs(f - float(base_val))
+            s = float(np.median(diff)) if np.median(diff) > 1e-12 else 1.0
+            shap_pos = shap_pos / s
+            base_val = float(base_val) / s
+            log.info(f"[SHAP] Normalizado por mediana |f(x)-base| (escala ~logit): factor={s:.4g}")
+        elif args.shap_normalize == 'by_l1_median':
+            l1 = np.sum(np.abs(shap_pos), axis=1)
+            s = float(np.median(l1)) if np.median(l1) > 1e-12 else 1.0
+            shap_pos = shap_pos / s
+            base_val = float(base_val) / s
+            log.info(f"[SHAP] Normalizado por mediana L1(SHAP): factor={s:.4g}")
+        elif args.shap_normalize == 'per_feature_zscore':
+            mu = shap_pos.mean(axis=0, keepdims=True)
+            sd = shap_pos.std(axis=0, keepdims=True) + 1e-12
+            shap_pos = (shap_pos - mu) / sd
+            base_val = 0.0  # pierde aditividad; fijamos base en 0 para plots tipo beeswarm/bar
+            log.info("[SHAP] Z-score per feature aplicado (comparabilidad de perfiles, no aditividad).")
+    # Normalizar base_value a escalar de la clase positiva
+    if isinstance(base_val, (list, tuple)):
         base_val = base_val[pos_idx]
+    elif isinstance(base_val, np.ndarray):
+        if base_val.ndim == 0:
+            base_val = float(base_val)
+        elif base_val.ndim == 1:
+            base_val = float(base_val[pos_idx])
+        elif base_val.ndim == 2:
+            # promedio entre muestras si viene por-sujeto y por-clase
+            base_val = float(np.mean(base_val[:, pos_idx]))
+        else:
+            base_val = float(np.ravel(base_val)[0])
 
     pack = {
         'shap_values': shap_pos.astype(np.float32),
@@ -736,7 +892,7 @@ def _ensure_background_processed(
 
         # 3️⃣  Si no, intentamos procesarlo desde cero
         log.info("[SHAP] Background DataFrame detectado pero columnas no coinciden; transformando…")
-        X_proc = preproc.transform(background_data)
+        X_proc = preproc.transform(background_data) if hasattr(preproc, "transform") else background_data.values
         if selector is not None:
             X_proc = selector.transform(X_proc)
         return pd.DataFrame(X_proc, columns=feat_names_target)
@@ -755,6 +911,22 @@ def _ensure_background_processed(
         return pd.DataFrame(background_data, columns=feat_names_target)
     # -----------------------------------------------------------------
     raise TypeError(f"Tipo de background desconocido: {type(background_data)}")
+
+# --- NUEVO: helper para aplicar freeze en DF procesado (columnas finales) ---
+def _apply_freeze_in_processed_df(df_proc: pd.DataFrame,
+                                  freeze_values: Dict[str, float]) -> pd.DataFrame:
+    """
+    Fija columnas de metadatos ya transformadas/nombradas en el espacio procesado,
+    buscando sufijos 'Age'/'__Age' y 'Sex'/'__Sex'.
+    """
+    cols = list(map(str, df_proc.columns))
+    def _targets(key: str) -> List[str]:
+        return [c for c in cols if c.endswith(key) or c.endswith(f"__{key}")]
+    out = df_proc.copy()
+    for k, v in freeze_values.items():
+        for c in _targets(k):
+            out.loc[:, c] = float(v)
+    return out
 
 
 def _compute_cn_median_baseline(
@@ -794,38 +966,44 @@ def _compute_cn_median_baseline(
 
 
 
-def _plot_shap_summary(shap_pos: np.ndarray,
-                       X_proc_df: pd.DataFrame,
-                       out_dir: Path,
-                       fold: int,
-                       clf: str,
-                       base_val: float) -> None:
-    # bar
+# ==============================================================================
+# FUNCIÓN DE PLOTEO CORREGIDA
+# ==============================================================================
+def _plot_shap_summary(shap_pos, X_proc_df, out_dir, fold, clf, base_val):
+    # Asegurar tipos numéricos "puros"
+    vals = np.asarray(shap_pos, dtype=np.float64)
+    feats = np.asarray(X_proc_df.values, dtype=np.float64)
+    names = list(X_proc_df.columns)
+    base = np.full(vals.shape[0], float(base_val), dtype=np.float64)
+
+    # Construimos un Explanation para usar la API moderna
+    exp = shap.Explanation(
+        values=vals,
+        base_values=base,
+        data=feats,
+        feature_names=names
+    )
+
+    # BAR (global importance)
     plt.figure(figsize=(10, 8))
-    shap.summary_plot(shap_pos, X_proc_df, plot_type='bar', show=False, max_display=20)
+    shap.plots.bar(exp, max_display=20, show=False)
     plt.title(f'SHAP Importancia Global (bar) - Fold {fold} - {clf.upper()}')
     plt.tight_layout()
     plt.savefig(out_dir / 'shap_global_importance_bar.png', dpi=150)
     plt.close()
 
-    # beeswarm
+    # BEESWARM (impacto por feature)
     plt.figure(figsize=(10, 8))
-    shap.summary_plot(shap_pos, X_proc_df, show=False, max_display=20)
+    shap.plots.beeswarm(exp, max_display=20, show=False)
     plt.title(f'SHAP Impacto Features (beeswarm) - Fold {fold} - {clf.upper()}')
     plt.tight_layout()
     plt.savefig(out_dir / 'shap_summary_beeswarm.png', dpi=150)
     plt.close()
 
-    # waterfall (primer sujeto) --- opcional: proteger si no hay muestras
-    if shap_pos.shape[0] > 0:
-        exp = shap.Explanation(
-            values=shap_pos,
-            base_values=np.full(shap_pos.shape[0], base_val, dtype=float),
-            data=X_proc_df.values,
-            feature_names=list(X_proc_df.columns)
-        )
+    # WATERFALL (primer sujeto)
+    if vals.shape[0] > 0:
         plt.figure(figsize=(12, 8))
-        shap.waterfall_plot(exp[0], max_display=20, show=False)
+        shap.plots.waterfall(exp[0], show=False, max_display=20)
         plt.tight_layout()
         plt.savefig(out_dir / 'shap_waterfall_subject_0.png', dpi=150)
         plt.close()
@@ -1218,6 +1396,25 @@ def parse_args() -> argparse.Namespace:
 
     p_shap.add_argument('--roi_order_path', default=None, help='(Opcional) ruta a ROI order si no está en run_dir.')
     p_shap.add_argument('--kernel_nsamples', type=int, default=100, help='nsamples para KernelExplainer (modelos no tree).')
+
+    p_shap.add_argument('--shap_link', default='identity', choices=['identity','logit'],
+                        help="Escala de explicación; 'logit' aplica log(p/(1-p)) a predict_proba[:,pos].")
+    # --- ESTABILIZAR BACKGROUND ENTRE FOLDS ---
+    p_shap.add_argument('--bg_mode', default='train',
+                        choices=['train','global','global_cn'],
+                        help="train: background del TRAIN del fold (actual); global: muestra fija CN+AD; global_cn: sólo CN.")
+    p_shap.add_argument('--bg_sample_size', type=int, default=100, help='Tamaño del background canónico.')
+    p_shap.add_argument('--bg_seed', type=int, default=42, help='Semilla para muestreo del background canónico.')
+
+    # --- NORMALIZACIÓN POST-HOC DE SHAP PARA COMPARABILIDAD ---
+    p_shap.add_argument('--shap_normalize', default='none',
+                        choices=['none','by_logit_median','by_l1_median','per_feature_zscore'],
+                        help="Escala común entre folds: 'by_logit_median' recomendado; alternativas: 'by_l1_median' o 'per_feature_zscore'.")
+    p_shap.add_argument('--freeze_meta', nargs='*', default=None,
+                        help="Lista opcional de metadatos a congelar (p.ej.: Age Sex).")
+    p_shap.add_argument('--freeze_strategy', default='train_stats',
+                        choices=['train_stats','constants'],
+                        help="train_stats: Age=mediana(TRAIN), Sex=modo(TRAIN). constants: Age=70, Sex=0.")
 
     # subcomando SALIENCY -----------------------------------------------------
     p_sal = sub.add_parser('saliency', help='Generar mapas de saliencia a partir del shap_pack.')
