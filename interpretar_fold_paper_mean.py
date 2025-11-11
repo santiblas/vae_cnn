@@ -342,6 +342,7 @@ def cmd_shap(args: argparse.Namespace) -> None:
     fold_dir = Path(args.run_dir) / f"fold_{args.fold}"
     out_dir = fold_dir / 'interpretability_shap'
     out_dir.mkdir(parents=True, exist_ok=True)
+    tag = f"_{args.shap_tag}" if getattr(args, 'shap_tag', None) else ""
 
     log.info(f"[SHAP] fold={args.fold} clf={args.clf}")
 
@@ -501,12 +502,15 @@ def cmd_shap(args: argparse.Namespace) -> None:
 
 
     # 7) Background: cargar o construir AHORA (ya existen cnad, tensor_all, norm_params, vae, device, preproc, selector, feat_names)
-    bg_path_raw = fold_dir / f"shap_background_raw_{args.clf}_{args.bg_mode}.joblib"
-    bg_path_proc = fold_dir / f"shap_background_proc_{args.clf}_{args.bg_mode}.joblib"
+    bg_path_raw = fold_dir / f"shap_background_raw_{args.clf}_{args.bg_mode}{tag}.joblib"
+    bg_path_proc = fold_dir / f"shap_background_proc_{args.clf}_{args.bg_mode}{tag}.joblib"
 
     if bg_path_proc.exists() and not args.freeze_meta:
         log.info(f"[SHAP] Cargando background PROCESADO (cache): {bg_path_proc.name}")
         background_proc = joblib.load(bg_path_proc)
+        # asegurar numérico puro (evita dtype('O') en cache antiguas)
+        if isinstance(background_proc, pd.DataFrame):
+            background_proc = background_proc.apply(pd.to_numeric, errors='coerce').astype(float)
     else:
         # 🔁 Reconstrucción coherente desde RAW (si hay freeze_meta o no existe cache)
         if bg_path_raw.exists():
@@ -573,6 +577,11 @@ def cmd_shap(args: argparse.Namespace) -> None:
 
     base_val = None # Inicializamos por si acaso
 
+    print(background_proc.dtypes.unique())
+    print(X_proc_df.dtypes.unique())
+# Deben terminar todos como float64
+
+
     if args.clf in {'xgb', 'gb', 'rf', 'lgbm'}:
         log.info(f"[SHAP] Usando TreeExplainer para {args.clf}.")
         explainer = shap.TreeExplainer(model, background_proc)
@@ -587,57 +596,109 @@ def cmd_shap(args: argparse.Namespace) -> None:
         shap_all = explainer.shap_values(X_proc_df)
         base_val = explainer.expected_value
 
+    # --- reemplaza el bloque "else: Usando KernelExplainer ..." por:
     else:
-        log.info("[SHAP] Usando KernelExplainer (controlado por --kernel_nsamples).")
-        k = min(50, len(background_proc))
-        np.random.seed(args.seed)
-        log.info(f"[SHAP] Resumiendo background de {len(background_proc)} → {k} centroides (kmeans).")
-        bg_array = background_proc.values if isinstance(background_proc, pd.DataFrame) else np.asarray(background_proc)
-        summary = shap.kmeans(bg_array, k)
-        bg_np = getattr(summary, "data", summary)
-        explainer = shap.KernelExplainer(_predict_linked, bg_np)
-        shap_all = explainer.shap_values(X_proc_df.values, nsamples=args.kernel_nsamples)
-        base_val = explainer.expected_value
+        log.info("[SHAP] Usando shap.Explainer + Independent masker (permutation/interventional).")
+        # El masker conoce la distribución marginal del background y evita artefactos en columnas constantes
+        # Asegurar tipos numéricos puros para SHAP (evita Int64/Float64/NA/obj)
+        if isinstance(background_proc, pd.DataFrame):
+            background_for_masker = background_proc.to_numpy(dtype=float)
+        else:
+            background_for_masker = np.asarray(background_proc, dtype=float)
+        # idem para X_proc_df
+        X_proc_df = X_proc_df.apply(pd.to_numeric, errors='coerce').astype(float)
+        masker = shap.maskers.Independent(background_for_masker)
 
+        def _predict_pos(X_np: np.ndarray) -> np.ndarray:
+            # preservamos nombres (muchos modelos esperan DataFrame, no solo array)
+            X_df = pd.DataFrame(X_np, columns=feat_names)
+            return _predict_linked(X_df)  # devuelve proba o logit de la clase positiva
+
+        explainer = shap.Explainer(
+            _predict_pos,
+            masker,
+            algorithm="permutation",          # robusto con colinealidad/constantes
+            feature_names=feat_names
+        )
+        # Para Permutation, max_evals debe ser >= 2*F + 1
+        F = X_proc_df.shape[1]
+        min_required = 2 * F + 1
+        # Reutilizamos --kernel_nsamples como presupuesto; si es menor, subimos al mínimo
+        budget = getattr(args, "kernel_nsamples", 500)
+        max_evals = int(max(min_required, budget))
+        log.info(f"[SHAP] Permutation: F={F}, min_required={min_required}, usando max_evals={max_evals}.")
+        sv = explainer(
+            X_proc_df.to_numpy(dtype=float),
+            max_evals=max_evals
+        )     # sv.values -> (N,F), sv.base_values -> (N,)
+        shap_all = sv.values
+        base_val = sv.base_values
+
+
+
+    # --- Reducir/normalizar base_value temprano (soporta lista, vector N, matriz N×C) ---
+    base_val_raw = base_val
+    def _reduce_base_value_to_scalar(bv, pos_idx: int) -> float:
+        if isinstance(bv, (list, tuple)):
+            bv = np.asarray(bv)
+        if isinstance(bv, np.ndarray):
+            if bv.ndim == 0:
+                return float(bv)
+            if bv.ndim == 1:                 # típico de permutation: (N,)
+                return float(np.median(bv))  # robusto
+            if bv.ndim == 2:                 # (N, clases)
+                return float(np.mean(bv[:, pos_idx]))
+            return float(np.ravel(bv)[0])
+        return float(bv)
+    base_val_scalar = _reduce_base_value_to_scalar(base_val, pos_idx)
 
     # 9) Clase positiva y empaquetado
     shap_pos = _to_sample_feature(shap_all, pos_idx, *X_proc_df.shape)
+
+    # ----- ZEROS para columnas constantes en X_test y background -----
+    try:
+        const_in_x = X_proc_df.std(numeric_only=True) < 1e-12
+        const_in_bg = background_proc.std(numeric_only=True) < 1e-12
+        const_mask = (const_in_x & const_in_bg).reindex(X_proc_df.columns).fillna(False).to_numpy()
+        if np.any(const_mask):
+            shap_pos[:, const_mask] = 0.0
+            # opcional: si shap_all es lista/3D (multiclase), replica el zeroing ahí también
+            log.info(f"[SHAP] SHAP forzados a 0 por ser constantes: {list(X_proc_df.columns[const_mask])}")
+    except Exception as e:
+        log.warning(f"[SHAP] Guardia de constantes omitida: {e}")
+        # ---------------------------------------------------------------
+
+
 
     # --- NORMALIZACIÓN POST-HOC ENTRE FOLDS (opcional) ---
     if args.shap_normalize != 'none':
         if args.shap_normalize == 'by_logit_median':
             # usar misma definición que el explainer para f(x)
             f = _predict_linked(X_proc_df)
-            diff = np.abs(f - float(base_val))
-            s = float(np.median(diff)) if np.median(diff) > 1e-12 else 1.0
+            # Si base_value es vector por muestra, usalo; si no, usá el escalar
+            if isinstance(base_val_raw, np.ndarray) and base_val_raw.ndim == 1 and base_val_raw.shape[0] == f.shape[0]:
+                diff = np.abs(f - base_val_raw.astype(float))
+            else:
+                diff = np.abs(f - base_val_scalar)
+            med = float(np.median(diff)) if np.isfinite(diff).all() else 0.0
+            s = med if med > 1e-12 else 1.0
             shap_pos = shap_pos / s
-            base_val = float(base_val) / s
+            base_val_scalar = base_val_scalar / s
             log.info(f"[SHAP] Normalizado por mediana |f(x)-base| (escala ~logit): factor={s:.4g}")
         elif args.shap_normalize == 'by_l1_median':
             l1 = np.sum(np.abs(shap_pos), axis=1)
             s = float(np.median(l1)) if np.median(l1) > 1e-12 else 1.0
             shap_pos = shap_pos / s
-            base_val = float(base_val) / s
+            base_val_scalar = base_val_scalar / s
             log.info(f"[SHAP] Normalizado por mediana L1(SHAP): factor={s:.4g}")
         elif args.shap_normalize == 'per_feature_zscore':
             mu = shap_pos.mean(axis=0, keepdims=True)
             sd = shap_pos.std(axis=0, keepdims=True) + 1e-12
             shap_pos = (shap_pos - mu) / sd
-            base_val = 0.0  # pierde aditividad; fijamos base en 0 para plots tipo beeswarm/bar
+            base_val_scalar = 0.0  # pierde aditividad; fijamos base en 0 para plots tipo beeswarm/bar
             log.info("[SHAP] Z-score per feature aplicado (comparabilidad de perfiles, no aditividad).")
-    # Normalizar base_value a escalar de la clase positiva
-    if isinstance(base_val, (list, tuple)):
-        base_val = base_val[pos_idx]
-    elif isinstance(base_val, np.ndarray):
-        if base_val.ndim == 0:
-            base_val = float(base_val)
-        elif base_val.ndim == 1:
-            base_val = float(base_val[pos_idx])
-        elif base_val.ndim == 2:
-            # promedio entre muestras si viene por-sujeto y por-clase
-            base_val = float(np.mean(base_val[:, pos_idx]))
-        else:
-            base_val = float(np.ravel(base_val)[0])
+    # A partir de acá usamos siempre el escalar reducido
+    base_val = float(base_val_scalar)
 
     pack = {
         'shap_values': shap_pos.astype(np.float32),
@@ -653,7 +714,7 @@ def cmd_shap(args: argparse.Namespace) -> None:
         'metadata_features': meta_cols,
         'seed_used': int(args.seed),
     }
-    pack_path = out_dir / f'shap_pack_{args.clf}.joblib'
+    pack_path = out_dir / f'shap_pack_{args.clf}{tag}.joblib'
     joblib.dump(pack, pack_path)
     log.info(f"[SHAP] Pack guardado: {pack_path}")
 
@@ -888,14 +949,17 @@ def _ensure_background_processed(
         #     solo le ponemos los nombres que espera el clasificador
         if background_data.shape[1] == len(feat_names_target):
             log.info("[SHAP] Background ya parece procesado; renombrando columnas.")
-            return background_data.set_axis(feat_names_target, axis=1, copy=False)
+            df = background_data.set_axis(feat_names_target, axis=1, copy=False)
+            return df.apply(pd.to_numeric, errors='coerce').astype(float)
+
 
         # 3️⃣  Si no, intentamos procesarlo desde cero
         log.info("[SHAP] Background DataFrame detectado pero columnas no coinciden; transformando…")
         X_proc = preproc.transform(background_data) if hasattr(preproc, "transform") else background_data.values
         if selector is not None:
             X_proc = selector.transform(X_proc)
-        return pd.DataFrame(X_proc, columns=feat_names_target)
+        df = pd.DataFrame(X_proc, columns=feat_names_target)
+        return df.apply(pd.to_numeric, errors='coerce').astype(float)
     # -----------------------------------------------------------------
     # resto del cuerpo idéntico, pero añade selector en el branch ndarray
     if isinstance(background_data, np.ndarray):
@@ -908,7 +972,10 @@ def _ensure_background_processed(
                 f"pero se esperaban {len(feat_names_target)}. No se puede continuar de forma segura."
             )
         # Si el número de columnas coincide, lo convertimos a DataFrame.
-        return pd.DataFrame(background_data, columns=feat_names_target)
+        return pd.DataFrame(
+            np.asarray(background_data, dtype=float),
+            columns=feat_names_target
+        )
     # -----------------------------------------------------------------
     raise TypeError(f"Tipo de background desconocido: {type(background_data)}")
 
@@ -989,7 +1056,8 @@ def _plot_shap_summary(shap_pos, X_proc_df, out_dir, fold, clf, base_val):
     shap.plots.bar(exp, max_display=20, show=False)
     plt.title(f'SHAP Importancia Global (bar) - Fold {fold} - {clf.upper()}')
     plt.tight_layout()
-    plt.savefig(out_dir / 'shap_global_importance_bar.png', dpi=150)
+    suffix = ""  # dejamos el mismo nombre para compat; el pack ya lleva tag
+    plt.savefig(out_dir / f'shap_global_importance_bar{suffix}.png', dpi=150)
     plt.close()
 
     # BEESWARM (impacto por feature)
@@ -997,7 +1065,7 @@ def _plot_shap_summary(shap_pos, X_proc_df, out_dir, fold, clf, base_val):
     shap.plots.beeswarm(exp, max_display=20, show=False)
     plt.title(f'SHAP Impacto Features (beeswarm) - Fold {fold} - {clf.upper()}')
     plt.tight_layout()
-    plt.savefig(out_dir / 'shap_summary_beeswarm.png', dpi=150)
+    plt.savefig(out_dir / f'shap_summary_beeswarm{suffix}.png', dpi=150)
     plt.close()
 
     # WATERFALL (primer sujeto)
@@ -1005,7 +1073,7 @@ def _plot_shap_summary(shap_pos, X_proc_df, out_dir, fold, clf, base_val):
         plt.figure(figsize=(12, 8))
         shap.plots.waterfall(exp[0], show=False, max_display=20)
         plt.tight_layout()
-        plt.savefig(out_dir / 'shap_waterfall_subject_0.png', dpi=150)
+        plt.savefig(out_dir / f'shap_waterfall_subject_0{suffix}.png', dpi=150)
         plt.close()
 
 
@@ -1015,7 +1083,8 @@ def cmd_saliency(args: argparse.Namespace) -> None:
     _set_all_seeds(args.seed)
     fold_dir = Path(args.run_dir) / f"fold_{args.fold}"
     shap_dir = fold_dir / 'interpretability_shap'
-    pack_path = shap_dir / f'shap_pack_{args.clf}.joblib'
+    tag = f"_{args.shap_tag}" if getattr(args, 'shap_tag', None) else ""
+    pack_path = shap_dir / f'shap_pack_{args.clf}{tag}.joblib'
     if not pack_path.exists():
         raise FileNotFoundError(f"No se encontró shap_pack para {args.clf} en {pack_path}. Corre primero el subcomando 'shap'.")
 
@@ -1415,6 +1484,8 @@ def parse_args() -> argparse.Namespace:
     p_shap.add_argument('--freeze_strategy', default='train_stats',
                         choices=['train_stats','constants'],
                         help="train_stats: Age=mediana(TRAIN), Sex=modo(TRAIN). constants: Age=70, Sex=0.")
+    p_shap.add_argument('--shap_tag', default=None,
+                        help="Sufijo para no pisar artefactos (p.ej., 'frozen' o 'unfrozen').")
 
     # subcomando SALIENCY -----------------------------------------------------
     p_sal = sub.add_parser('saliency', help='Generar mapas de saliencia a partir del shap_pack.')
@@ -1437,7 +1508,9 @@ def parse_args() -> argparse.Namespace:
                        default='cn_median_train',
                        choices=['zeros', 'cn_median_train', 'cn_median_test'],
                        help='Baseline para IG: ceros (antiguo), mediana CN del TRAIN (recomendado), o mediana CN del TEST.')
- 
+    p_sal.add_argument('--shap_tag', default=None,
+                        help="Sufijo del pack SHAP a usar (debe coincidir con el usado en 'shap').")
+
 
     return parser.parse_args()
 
